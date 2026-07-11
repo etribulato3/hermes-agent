@@ -18743,11 +18743,40 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
 
+    def _tick_named_profile_crons():
+        """Tick cron stores for named profiles from the default gateway."""
+        from hermes_cli.profiles import list_profiles
+        from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+        import cron.jobs as cron_jobs
+
+        def _retarget_cron_jobs(home: Path) -> None:
+            # cron.jobs keeps storage paths as module globals; retarget them
+            # alongside the context-local Hermes home override.
+            cron_jobs.HERMES_DIR = home.resolve()
+            cron_jobs.CRON_DIR = cron_jobs.HERMES_DIR / "cron"
+            cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
+            cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
+
+        default_home = get_hermes_home()
+        for profile in list_profiles():
+            if profile.is_default or not (profile.path / "cron" / "jobs.json").exists():
+                continue
+            token = set_hermes_home_override(profile.path)
+            try:
+                _retarget_cron_jobs(profile.path)
+                cron_tick(verbose=False, adapters=adapters, loop=loop)
+            except Exception as e:
+                logger.debug("Cron tick error for profile %s: %s", profile.name, e)
+            finally:
+                _retarget_cron_jobs(default_home)
+                reset_hermes_home_override(token)
+
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
         try:
             cron_tick(verbose=False, adapters=adapters, loop=loop)
+            _tick_named_profile_crons()
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
 
