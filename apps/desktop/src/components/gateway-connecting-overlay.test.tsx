@@ -129,6 +129,7 @@ describe('connecting overlay vs recovery surface', () => {
 
   it('soft gateway switch keeps the shell — no fullscreen CONNECTING', () => {
     setGatewayState('open')
+
     const { rerender } = render(
       <>
         <GatewayConnectingOverlay />
