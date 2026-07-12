@@ -1,18 +1,16 @@
 import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import { closeActiveTab } from '@/app/chat/close-tab'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
-import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
-import { matchesQuery } from '@/hooks/use-media-query'
-import { PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
+import { activateTreeTabSlot, layoutHasRootSide } from '@/components/pane-shell/tree/store'
+import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
 import { $repoStatus } from '@/store/coding-status'
 import { toggleCommandPalette } from '@/store/command-palette'
 import { $capture, $comboIndex, endCapture, setBinding, toggleKeybindPanel } from '@/store/keybinds'
 import {
-  CHAT_SIDEBAR_PANE_ID,
-  FILE_BROWSER_PANE_ID,
   requestSessionSearchFocus,
   setFileBrowserOpen,
   toggleFileBrowserOpen,
@@ -30,6 +28,7 @@ import {
 import { requestNewWorktree } from '@/store/projects'
 import { toggleReview } from '@/store/review'
 import { setModelPickerOpen } from '@/store/session'
+import { reopenLastClosedTile } from '@/store/session-states'
 import {
   $switcherOpen,
   closeSwitcher,
@@ -45,7 +44,6 @@ import { openNewSessionInNewWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
 import { requestComposerFocus, requestVoiceToggle } from '../chat/composer/focus'
-import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '../layout-constants'
 import {
   AGENTS_ROUTE,
   ARTIFACTS_ROUTE,
@@ -82,7 +80,13 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
   const profileSwitchHandlers: HandlerMap = {}
 
   for (let slot = 1; slot <= PROFILE_SLOT_COUNT; slot += 1) {
-    profileSwitchHandlers[`profile.switch.${slot}`] = () => switchProfileToSlot(slot)
+    // ⌘1…⌘9 switch the FOCUSED zone's tab when it's a real tab strip; only a
+    // single-pane (or unfocused) layout falls through to the profile switch.
+    profileSwitchHandlers[`profile.switch.${slot}`] = () => {
+      if (!activateTreeTabSlot(slot)) {
+        switchProfileToSlot(slot)
+      }
+    }
   }
 
   const goToSession = (sessionId: null | string) => {
@@ -148,20 +152,13 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // through instead of silently doing nothing).
     'workspace.newWorktree': () => $repoStatus.get() && requestNewWorktree(),
 
-    'view.toggleSidebar': () => {
-      if (matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
-        window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: CHAT_SIDEBAR_PANE_ID } }))
-      } else {
-        toggleSidebarOpen()
-      }
-    },
-    'view.toggleRightSidebar': () => {
-      if (matchesQuery(SIDEBAR_COLLAPSE_MEDIA_QUERY)) {
-        window.dispatchEvent(new CustomEvent(PANE_TOGGLE_REVEAL_EVENT, { detail: { id: FILE_BROWSER_PANE_ID } }))
-      } else {
-        toggleFileBrowserOpen()
-      }
-    },
+    // Narrow-viewport reveal is handled inside the store toggles now.
+    'view.toggleSidebar': toggleSidebarOpen,
+    // ⌘J toggles the right sidebar — but a layout with no right side (e.g.
+    // terminal-on-bottom) would leave it a dead key, so it falls back to the
+    // terminal there. The single "secondary panel" toggle.
+    'view.toggleRightSidebar': () =>
+      layoutHasRootSide('right') ? toggleFileBrowserOpen() : setTerminalTakeover(!$terminalTakeover.get()),
     'view.toggleReview': toggleReview,
     'view.showFiles': showFiles,
     'view.showTerminal': () => setTerminalTakeover(!$terminalTakeover.get()),
@@ -177,6 +174,12 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'view.prevTerminal': () => $terminalTakeover.get() && cycleTerminal(-1),
     'view.closeTerminal': () => $terminalTakeover.get() && closeActiveTerminal(),
     'view.flipPanes': togglePanesFlipped,
+    // ⌘W: close the focused tab (terminal / preview target / zone tree tab).
+    // On macOS the menu accelerator owns ⌘W and routes through the same
+    // closeActiveTab via IPC (see use-desktop-integrations); this binding is
+    // the Win/Linux path where ⌘W reaches the renderer directly.
+    'view.closeTab': () => void closeActiveTab(),
+    'view.reopenTab': reopenLastClosedTile,
 
     'appearance.toggleMode': () => setMode(resolvedMode === 'dark' ? 'light' : 'dark'),
 
@@ -242,7 +245,9 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         return
       }
 
-      const handler = handlersRef.current[actionId]
+      // Built-in handlers first (they carry React context); contributed
+      // actions bring their own `run` through the registry.
+      const handler = handlersRef.current[actionId] ?? contributedKeybindHandler(actionId)
 
       if (!handler) {
         return
