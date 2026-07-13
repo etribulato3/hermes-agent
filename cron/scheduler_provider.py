@@ -169,6 +169,25 @@ class InProcessCronScheduler(CronScheduler):
         from cron.jobs import record_ticker_heartbeat
 
         logger = logging.getLogger("cron.scheduler_provider")
+
+        def tick_named_profile_crons() -> None:
+            """Tick cron stores for named profiles from the default gateway."""
+            from cron.jobs import use_cron_store
+            from hermes_cli.profiles import list_profiles
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            for profile in list_profiles():
+                if profile.is_default or not (profile.path / "cron" / "jobs.json").exists():
+                    continue
+                token = set_hermes_home_override(profile.path)
+                try:
+                    with use_cron_store(profile.path):
+                        cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
+                except BaseException as e:
+                    logger.error("Cron tick error for profile %s: %s", profile.name, e, exc_info=True)
+                finally:
+                    reset_hermes_home_override(token)
+
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
@@ -177,6 +196,7 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             try:
                 cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
+                tick_named_profile_crons()
                 ok = True
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from
