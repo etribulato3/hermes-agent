@@ -649,7 +649,8 @@ def execute_disposable_cron_prune(
         retention_safe=True,
         session_ids=exact_ids,
     )
-    if [str(row["id"]) for row in rows] != list(exact_ids):
+    eligible_ids = {str(row["id"]) for row in rows}
+    if eligible_ids != set(exact_ids):
         raise ValueError("exact retention set changed; pruned nothing")
     estimated_bytes, message_count = db.estimate_sessions_logical_bytes(exact_ids)
     pruned = db.prune_sessions(

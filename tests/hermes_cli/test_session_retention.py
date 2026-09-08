@@ -308,3 +308,20 @@ def test_exact_disposable_cron_prune_never_archives_and_requires_all_ids(db, tmp
     assert result["pruned_count"] == 1
     assert result["archived_count"] == 0
     assert db.get_session("disposable") is None
+
+
+def test_exact_disposable_cron_prune_accepts_same_ids_in_any_order(db, tmp_path):
+    _ended(db, "z-older", "cron", 20, "cron_complete")
+    _ended(db, "a-newer", "cron", 10, "cron_complete")
+
+    result = execute_disposable_cron_prune(
+        db,
+        session_ids=["a-newer", "z-older"],
+        sessions_dir=tmp_path / "sessions",
+        audit_path=tmp_path / "audit.jsonl",
+        min_free_bytes=0,
+    )
+
+    assert result["pruned_count"] == 2
+    assert db.get_session("a-newer") is None
+    assert db.get_session("z-older") is None
