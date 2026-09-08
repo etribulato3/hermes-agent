@@ -13742,6 +13742,31 @@ def main():
         help="Also delete archived sessions (excluded by default)",
     )
 
+    sessions_retention = sessions_subparsers.add_parser(
+        "retention",
+        help="Source-aware retention dry-run (execution requires explicit archive+prune authority)",
+    )
+    sessions_retention.add_argument("--profile-label", default="default")
+    sessions_retention.add_argument("--settled-session-ids")
+    sessions_retention.add_argument("--protected-session-ids")
+    sessions_retention.add_argument("--batch-size", type=int, default=100)
+    sessions_retention.add_argument("--archive-host")
+    sessions_retention.add_argument("--archive-root", default="HermesArchive")
+    sessions_retention.add_argument(
+        "--execute-cron-archive-prune", action="store_true"
+    )
+    sessions_retention.add_argument(
+        "--execute-disposable-cron-prune", action="store_true"
+    )
+    sessions_retention.add_argument(
+        "--disposable-session-ids",
+        help="Exact newline-delimited externally settled disposable cron session IDs",
+    )
+    sessions_retention.add_argument("--authorization")
+    sessions_retention.add_argument(
+        "--min-free-bytes", type=int, default=2 * 1024 * 1024 * 1024
+    )
+
     sessions_archive = sessions_subparsers.add_parser(
         "archive",
         help="Bulk-archive (soft-hide) sessions matching filters — no deletion",
@@ -13808,6 +13833,12 @@ def main():
         import json as _json
 
         action = args.sessions_action
+
+        if action == "retention":
+            from hermes_cli.session_retention import run_retention_cli
+
+            run_retention_cli(args)
+            return
 
         # 'repair' must run BEFORE opening SessionDB(): a malformed schema is
         # exactly the case where SessionDB() can't open, so it operates on the

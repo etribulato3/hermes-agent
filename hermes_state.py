@@ -27,7 +27,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -5673,6 +5673,8 @@ class SessionDB:
         max_cost: Optional[float] = None,
         min_tool_calls: Optional[int] = None,
         max_tool_calls: Optional[int] = None,
+        session_ids: Optional[Sequence[str]] = None,
+        retention_safe: bool = False,
     ) -> Tuple[str, list]:
         """Build the shared WHERE clause for bulk prune/archive selection.
 
@@ -5694,6 +5696,13 @@ class SessionDB:
         """
         clauses = ["s.ended_at IS NOT NULL"]
         params: list = []
+        if session_ids is not None:
+            ids = list(dict.fromkeys(str(sid) for sid in session_ids))
+            if not ids:
+                clauses.append("0")
+            else:
+                clauses.append(f"s.id IN ({','.join('?' * len(ids))})")
+                params.extend(ids)
         if started_before is not None:
             clauses.append("s.started_at < ?")
             params.append(started_before)
@@ -5767,6 +5776,43 @@ class SessionDB:
             clauses.append("s.archived = 1")
         elif archived is False:
             clauses.append("s.archived = 0")
+        if retention_safe:
+            # Only a completed handoff is terminal. Pending/running/failed and
+            # unknown future states stay protected.
+            clauses.append("(s.handoff_state IS NULL OR s.handoff_state = 'completed')")
+            # Protect an entire compression/delegation lineage when any member
+            # is live. UNION also fails safely on a malformed parent cycle.
+            clauses.append(
+                """NOT EXISTS (
+                    WITH RECURSIVE lineage(id) AS (
+                        SELECT s.id
+                        UNION
+                        SELECT parent.parent_session_id
+                        FROM sessions parent JOIN lineage l ON parent.id = l.id
+                        WHERE parent.parent_session_id IS NOT NULL
+                        UNION
+                        SELECT child.id
+                        FROM sessions child JOIN lineage l
+                          ON child.parent_session_id = l.id
+                    )
+                    SELECT 1 FROM sessions live
+                    JOIN lineage ON lineage.id = live.id
+                    WHERE live.ended_at IS NULL
+                )"""
+            )
+            # Goal payloads are content-bearing JSON. Only known terminal
+            # states are safe; malformed and future states protect fail-closed.
+            clauses.append(
+                """NOT EXISTS (
+                    SELECT 1 FROM state_meta goal
+                    WHERE goal.key = 'goal:' || s.id
+                      AND (
+                        json_valid(goal.value) = 0
+                        OR COALESCE(json_extract(goal.value, '$.status'), 'active')
+                           NOT IN ('done', 'completed', 'cleared', 'cancelled', 'failed')
+                      )
+                )"""
+            )
         return " AND ".join(clauses), params
 
     def list_prune_candidates(
@@ -5796,6 +5842,54 @@ class SessionDB:
                 params,
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def estimate_sessions_logical_bytes(
+        self, session_ids: Sequence[str]
+    ) -> Tuple[int, int]:
+        """Estimate logical payload bytes and message rows for exact sessions.
+
+        This sums SQLite value lengths for the canonical ``sessions`` and
+        ``messages`` rows only. It does not inspect or return content and does
+        not claim physical filesystem reclaim (FTS/WAL/page reuse differ).
+        """
+        ids = list(dict.fromkeys(str(sid) for sid in session_ids))
+        if not ids:
+            return 0, 0
+
+        def _row_size_sql(table: str) -> str:
+            columns = [
+                row["name"]
+                for row in self._conn.execute(f'PRAGMA table_info("{table}")')
+            ]
+            return " + ".join(
+                f'COALESCE(length(CAST("{column}" AS BLOB)), 0)'
+                for column in columns
+            )
+
+        with self._lock:
+            session_size = _row_size_sql("sessions")
+            message_size = _row_size_sql("messages")
+            logical_bytes = 0
+            message_count = 0
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset : offset + 500]
+                placeholders = ",".join("?" * len(chunk))
+                logical_bytes += int(
+                    self._conn.execute(
+                        f"SELECT COALESCE(SUM({session_size}), 0) FROM sessions "
+                        f"WHERE id IN ({placeholders})",
+                        chunk,
+                    ).fetchone()[0]
+                    or 0
+                )
+                row = self._conn.execute(
+                    f"SELECT COALESCE(SUM({message_size}), 0), COUNT(*) "
+                    f"FROM messages WHERE session_id IN ({placeholders})",
+                    chunk,
+                ).fetchone()
+                logical_bytes += int(row[0] or 0)
+                message_count += int(row[1] or 0)
+        return logical_bytes, message_count
 
     def archive_sessions(
         self,
@@ -5862,6 +5956,15 @@ class SessionDB:
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
+        require_all = bool(filters.pop("require_all", False))
+        requested_ids = filters.get("session_ids")
+        expected_ids = (
+            set(dict.fromkeys(str(sid) for sid in requested_ids))
+            if requested_ids is not None
+            else None
+        )
+        if require_all and expected_ids is None:
+            raise ValueError("require_all needs an exact session_ids set")
         if filters.get("started_before") is None and older_than_days is not None:
             filters["started_before"] = time.time() - (older_than_days * 86400)
         where, where_params = self._prune_filter_where(source=source, **filters)
@@ -5872,6 +5975,9 @@ class SessionDB:
                 f"SELECT s.id FROM sessions s WHERE {where}", where_params
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
+
+            if require_all and session_ids != expected_ids:
+                raise ValueError("exact retention set changed; pruned nothing")
 
             if not session_ids:
                 return 0
