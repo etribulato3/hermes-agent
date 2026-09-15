@@ -5271,6 +5271,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._enqueue_fifo(session_key, event, adapter)
 
+    async def _consume_authorized_gateway_message(self, event: MessageEvent) -> bool:
+        """Bounded post-auth handoff; a failed handoff must not start chat."""
+        if event.internal:
+            return False
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            return await asyncio.wait_for(
+                get_plugin_manager().consume_gateway_message(event), timeout=10.0,
+            )
+        except Exception:
+            logger.warning("Post-authorization gateway route failed closed")
+            return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -5287,6 +5300,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        if await self._consume_authorized_gateway_message(event):
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -8997,6 +9013,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        if not is_internal and await self._consume_authorized_gateway_message(event):
+            return None
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

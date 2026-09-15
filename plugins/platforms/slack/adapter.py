@@ -1085,8 +1085,8 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register message event handler
             @self._app.event("message")
-            async def handle_message_event(event, say):
-                await self._handle_slack_message(event)
+            async def handle_message_event(event, say, body=None):
+                await self._handle_slack_message(event, socket_body=body)
 
             # Handle app_mention explicitly. In some Slack app configurations,
             # channel mentions arrive only as app_mention events rather than the
@@ -1096,8 +1096,8 @@ class SlackAdapter(BasePlatformAdapter):
             # @mention, they share the same event ts — the dedup in
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
-                await self._handle_slack_message(event)
+            async def handle_app_mention(event, say, body=None):
+                await self._handle_slack_message(event, socket_body=body)
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -2586,8 +2586,17 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
-    async def _handle_slack_message(self, event: dict) -> None:
+    async def _handle_slack_message(self, event: dict, *, socket_body: Optional[dict] = None) -> None:
         """Handle an incoming Slack message event."""
+        # Snapshot only SDK-envelope identities, never tokens or event-supplied
+        # metadata. This is transport context, not an independent auth proof.
+        socket_metadata = {}
+        identity_keys = ("type", "team_id", "api_app_id", "event_id")
+        if (isinstance(socket_body, dict) and socket_body.get("event") == event
+                and socket_body.get("type") == "event_callback"
+                and all(isinstance(socket_body.get(key), str)
+                        and 0 < len(socket_body[key]) <= 256 for key in identity_keys)):
+            socket_metadata["slack_socket"] = {key: socket_body[key] for key in identity_keys}
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -3216,6 +3225,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=event,
+            metadata=socket_metadata,
             message_id=ts,
             media_urls=media_urls,
             media_types=media_types,

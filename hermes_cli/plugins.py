@@ -171,6 +171,7 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    "post_gateway_authorization",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).
@@ -1923,6 +1924,26 @@ class PluginManager:
                     exc,
                 )
         return results
+
+    async def consume_gateway_message(self, event: Any) -> bool:
+        """Run post-auth routes sequentially; stop after consumption or failure.
+
+        The gateway calls this only after its normal sender authorization.
+        A route returns True once handled, or None/False to leave it alone.
+        Exceptions deliberately propagate: fallback chat after a possibly
+        accepted external handoff would duplicate work.
+        """
+        import inspect
+
+        for callback in self._hooks.get("post_gateway_authorization", []):
+            result = callback(event=event)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is True:
+                return True
+            if result is not None and result is not False:
+                raise ValueError("invalid post-authorization route result")
+        return False
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
