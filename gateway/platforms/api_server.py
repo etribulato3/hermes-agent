@@ -62,6 +62,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.platforms import api_server_runs as _runs
 
 logger = logging.getLogger(__name__)
 
@@ -891,6 +892,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        self._run_idempotency_store: _runs.RunIdempotencyStore
+        self._run_idempotency_ids: set[str]
+        self._run_owner_pid: int
+        self._run_owner_started: int
+        _runs._initialize_run_state(self)
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -4152,6 +4158,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
+        previous_status = str(current.get("status") or "")
+        field_names = set(fields)
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -4161,6 +4169,16 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        should_persist = (
+            status != previous_status
+            or status in _runs.TERMINAL_STATUSES
+            or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"})
+        )
+        if run_id in self._run_idempotency_ids and should_persist:
+            try:
+                self._run_idempotency_store.update_status(run_id, current)
+            except Exception:
+                logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -4209,11 +4227,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    _replay_or_conflict = _runs._replay_or_conflict
+    _durable_run_status = _runs._durable_run_status
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if idempotency_key and not self._run_idempotency_store.durable:
+            assert web is not None
+            return web.json_response(
+                _openai_error("Durable run admission is unavailable", code="idempotency_unavailable"),
+                status=503,
+            )
 
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -4222,9 +4251,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        if not idempotency_key:
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
 
         try:
             body = await request.json()
@@ -4238,6 +4268,23 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
+
+        idempotency_fingerprint = ""
+        if idempotency_key:
+            idempotency_fingerprint = hashlib.sha256(json.dumps(
+                {"body": body, "gateway_session_key": gateway_session_key or ""},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest()
+            outcome, record = self._run_idempotency_store.lookup(
+                _runs.RUN_SCOPE, idempotency_key, idempotency_fingerprint,
+            )
+            if outcome != "missing":
+                return self._replay_or_conflict(
+                    request, outcome, record, gateway_session_key, _openai_error,
+                )
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -4332,6 +4379,23 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
         )
+
+        if idempotency_key:
+            try:
+                outcome, record = self._run_idempotency_store.reserve(
+                    _runs.RUN_SCOPE, idempotency_key, idempotency_fingerprint,
+                    run_id, self._run_statuses[run_id],
+                    owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
+                )
+            except Exception:
+                _runs._forget_unadmitted_run(self, run_id)
+                raise
+            if outcome != "created":
+                _runs._forget_unadmitted_run(self, run_id)
+                return self._replay_or_conflict(
+                    request, outcome, record, gateway_session_key, _openai_error,
+                )
+            self._run_idempotency_ids.add(run_id)
 
         # Per-client model routing for /v1/runs (see model_routes).
         route = self._resolve_route(body.get("model"))
@@ -4558,7 +4622,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        status = self._durable_run_status(request, run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -4953,6 +5017,10 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
+        try:
+            self._run_idempotency_store.close()
+        except Exception:
+            logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
         if self._response_store is not None:
             try:
                 self._response_store.close()
