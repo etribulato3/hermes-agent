@@ -80,6 +80,23 @@ async def test_post_gateway_authorization_awaits_consumer_and_short_circuits(mon
 
 
 @pytest.mark.asyncio
+async def test_post_gateway_authorization_sync_failure_fails_closed(monkeypatch):
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_ALLOWED")
+    manager = PluginManager()
+    context = PluginContext(PluginManifest(name="failing-consumer"), manager)
+
+    def consume(**_kwargs):
+        raise RuntimeError("synchronous consumer failure")
+
+    context.register_hook("post_gateway_authorization", consume)
+    monkeypatch.setattr("hermes_cli.plugins._plugin_manager", manager)
+
+    assert await _runner()._handle_message(_event()) is None
+
+
+@pytest.mark.asyncio
 async def test_post_gateway_authorization_never_runs_for_unauthorized_sender(monkeypatch):
     monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_ALLOWED")
     called = False

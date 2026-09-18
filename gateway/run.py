@@ -9010,6 +9010,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _post_auth_results = _invoke_hook(
                     "post_gateway_authorization",
+                    strict=True,
                     event=event,
                     gateway=self,
                     session_store=self.session_store,
