@@ -1085,8 +1085,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register message event handler
             @self._app.event("message")
-            async def handle_message_event(event, say):
-                await self._handle_slack_message(event)
+            async def handle_message_event(event, body, say):
+                await self._handle_slack_message(
+                    event,
+                    socket_context={key: body.get(key) for key in
+                                    ("type", "team_id", "api_app_id", "event_id")},
+                )
 
             # Handle app_mention explicitly. In some Slack app configurations,
             # channel mentions arrive only as app_mention events rather than the
@@ -1096,8 +1100,12 @@ class SlackAdapter(BasePlatformAdapter):
             # @mention, they share the same event ts — the dedup in
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
-                await self._handle_slack_message(event)
+            async def handle_app_mention(event, body, say):
+                await self._handle_slack_message(
+                    event,
+                    socket_context={key: body.get(key) for key in
+                                    ("type", "team_id", "api_app_id", "event_id")},
+                )
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -2586,7 +2594,12 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
-    async def _handle_slack_message(self, event: dict) -> None:
+    async def _handle_slack_message(
+        self,
+        event: dict,
+        *,
+        socket_context: Optional[dict] = None,
+    ) -> None:
         """Handle an incoming Slack message event."""
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
@@ -3223,6 +3236,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            metadata={"slack_socket": dict(socket_context)} if socket_context else {},
         )
 
         # Only react when bot is directly addressed (1:1 DM or @mention).

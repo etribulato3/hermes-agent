@@ -8996,7 +8996,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
-        
+
+        # Fire the production post-authorization seam only after the gateway's
+        # normal source checks have accepted this user. Async consumers (for
+        # example, an external lifecycle adapter) are awaited here so a handled
+        # event cannot fall through into the ordinary agent path. Consumer
+        # failures fail closed for this message instead of silently reaching a
+        # second lifecycle owner.
+        if not is_internal:
+            try:
+                import inspect as _inspect
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                _post_auth_results = _invoke_hook(
+                    "post_gateway_authorization",
+                    event=event,
+                    gateway=self,
+                    session_store=self.session_store,
+                )
+                for _result in _post_auth_results:
+                    if _inspect.isawaitable(_result):
+                        _result = await _result
+                    if isinstance(_result, dict) and _result.get("action") == "handled":
+                        return _result.get("result")
+            except Exception as _hook_exc:
+                logger.error(
+                    "post_gateway_authorization invocation failed closed: %s",
+                    _hook_exc,
+                )
+                return None
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
